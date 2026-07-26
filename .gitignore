@@ -1,0 +1,3 @@
+data/market-snapshot-cache.json
+data/wallet-balance.json
+*.tmp
