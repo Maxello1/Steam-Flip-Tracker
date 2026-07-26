@@ -9,28 +9,38 @@ const HOST = '127.0.0.1';
 const PORT = Number(process.env.PORT || 3210);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const DATA_DIR = path.join(__dirname, 'data');
-const CACHE_FILE = path.join(DATA_DIR, 'item-name-cache.json');
+const ITEM_NAME_CACHE_FILE = path.join(DATA_DIR, 'item-name-cache.json');
+const SNAPSHOT_CACHE_FILE = path.join(DATA_DIR, 'market-snapshot-cache.json');
+const WALLET_FILE = path.join(DATA_DIR, 'wallet-balance.json');
 
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36 SteamFlipTracker/1.0';
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36 SteamFlipTracker/1.1';
 const STEAM_BASE = 'https://steamcommunity.com';
+const SNAPSHOT_TTL_MS = 10 * 60 * 1000;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-function loadCache() {
+function loadJson(file, fallback) {
   try {
-    return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch {
-    return {};
+    return fallback;
   }
 }
 
-let itemNameCache = loadCache();
-
-function saveCache() {
-  const temp = `${CACHE_FILE}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(itemNameCache, null, 2));
-  fs.renameSync(temp, CACHE_FILE);
+function saveJsonAtomic(file, value) {
+  const temp = `${file}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(value, null, 2));
+  fs.renameSync(temp, file);
 }
+
+let itemNameCache = loadJson(ITEM_NAME_CACHE_FILE, {});
+let snapshotCache = loadJson(SNAPSHOT_CACHE_FILE, {});
+let walletState = loadJson(WALLET_FILE, {
+  balance: null,
+  currency: 'EUR',
+  source: 'unset',
+  updatedAt: null
+});
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -40,12 +50,14 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-function sendJson(res, status, payload) {
+function sendJson(res, status, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
-    'Cache-Control': 'no-store'
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+    ...extraHeaders
   });
   res.end(body);
 }
@@ -86,6 +98,28 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+async function readJsonBody(req, maxBytes = 16_384) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', chunk => {
+      body += chunk;
+      if (Buffer.byteLength(body) > maxBytes) {
+        reject(new Error('Request body is too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch {
+        reject(new Error('Invalid JSON body'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
 async function steamFetch(url, options = {}, retries = 2) {
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
@@ -105,7 +139,10 @@ async function steamFetch(url, options = {}, retries = 2) {
       clearTimeout(timeout);
 
       if (response.status === 429 || response.status >= 500) {
-        const wait = 2_500 * (attempt + 1);
+        const retryAfter = Number(response.headers.get('retry-after'));
+        const wait = Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : 2_500 * (attempt + 1);
         lastError = new Error(`Steam returned HTTP ${response.status}`);
         if (attempt < retries) {
           await sleep(wait);
@@ -113,15 +150,11 @@ async function steamFetch(url, options = {}, retries = 2) {
         }
       }
 
-      if (!response.ok) {
-        throw new Error(`Steam returned HTTP ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`Steam returned HTTP ${response.status}`);
       return response;
     } catch (error) {
       lastError = error;
-      if (attempt < retries) {
-        await sleep(1_500 * (attempt + 1));
-      }
+      if (attempt < retries) await sleep(1_500 * (attempt + 1));
     }
   }
   throw lastError || new Error('Steam request failed');
@@ -182,10 +215,14 @@ function makeMarketUrl(hashName) {
   return `${STEAM_BASE}/market/listings/753/${encodeURIComponent(hashName)}`;
 }
 
-async function getSearchResults({ pages, sortColumn, sortDir }) {
+function searchResultSellPrice(result) {
+  if (Number(result.sell_price) > 0) return Number(result.sell_price) / 100;
+  return parseLocalisedPrice(result.sell_price_text);
+}
+
+async function getSearchPool({ pages, sortColumn, sortDir, poolName }) {
   const all = [];
   let start = 0;
-  let pageSize = 10;
 
   for (let page = 0; page < pages; page += 1) {
     const url = new URL(`${STEAM_BASE}/market/search/render/`);
@@ -202,23 +239,53 @@ async function getSearchResults({ pages, sortColumn, sortDir }) {
     const response = await steamFetch(url);
     const data = await response.json();
     if (!data || !data.success || !Array.isArray(data.results)) {
-      throw new Error('Steam returned an unexpected search response');
+      throw new Error(`Steam returned an unexpected ${poolName} search response`);
     }
 
-    pageSize = Number(data.pagesize || data.results.length || 10);
-    all.push(...data.results);
-    start += pageSize;
-    if (start >= Number(data.total_count || 0) || data.results.length === 0) break;
-    await sleep(1_200);
+    const results = data.results.map(item => ({ ...item, discoveryPool: poolName }));
+    all.push(...results);
+    const advance = results.length || Number(data.pagesize || 10);
+    start += Math.max(1, advance);
+    if (start >= Number(data.total_count || 0) || results.length === 0) break;
+    await sleep(900);
+  }
+
+  return all;
+}
+
+function interleavePools(pools) {
+  const merged = [];
+  const maxLength = Math.max(0, ...pools.map(pool => pool.length));
+  for (let index = 0; index < maxLength; index += 1) {
+    for (const pool of pools) {
+      if (pool[index]) merged.push(pool[index]);
+    }
   }
 
   const seen = new Set();
-  return all.filter(result => {
+  return merged.filter(result => {
     const hashName = result.hash_name || result.asset_description?.market_hash_name;
     if (!hashName || seen.has(hashName)) return false;
     seen.add(hashName);
     return true;
   });
+}
+
+async function getSearchResults({ pages }) {
+  const popular = await getSearchPool({
+    pages,
+    sortColumn: 'popular',
+    sortDir: 'desc',
+    poolName: 'popular'
+  });
+  await sleep(1_000);
+  const cheap = await getSearchPool({
+    pages,
+    sortColumn: 'price',
+    sortDir: 'asc',
+    poolName: 'cheap'
+  });
+  return interleavePools([popular, cheap]);
 }
 
 async function getItemNameId(hashName) {
@@ -230,16 +297,32 @@ async function getItemNameId(hashName) {
     headers: { Referer: `${STEAM_BASE}/market/` }
   });
   const html = await response.text();
-  const match = html.match(/Market_LoadOrderSpread\(\s*(\d+)\s*\)/i)
-    || html.match(/item_nameid["']?\s*[:=]\s*["']?(\d+)/i);
+  const patterns = [
+    /Market_LoadOrderSpread\(\s*(\d+)\s*\)/i,
+    /item_nameid["']?\s*[:=]\s*["']?(\d+)/i,
+    /ItemActivityTicker\.Start\(\s*(\d+)\s*\)/i
+  ];
+  const match = patterns.map(pattern => html.match(pattern)).find(Boolean);
   if (!match) throw new Error('Could not read the Steam item name ID');
 
   itemNameCache[hashName] = {
     itemNameId: match[1],
     updatedAt: new Date().toISOString()
   };
-  saveCache();
+  saveJsonAtomic(ITEM_NAME_CACHE_FILE, itemNameCache);
   return match[1];
+}
+
+function bestGraphDepth(graph, mode) {
+  if (!Array.isArray(graph) || graph.length === 0) return 0;
+  const rows = graph
+    .filter(row => Array.isArray(row) && Number.isFinite(Number(row[0])))
+    .map(row => ({ price: Number(row[0]), depth: Number(row[1]) || 0 }));
+  if (!rows.length) return 0;
+  const bestPrice = mode === 'buy'
+    ? Math.max(...rows.map(row => row.price))
+    : Math.min(...rows.map(row => row.price));
+  return rows.find(row => row.price === bestPrice)?.depth || 0;
 }
 
 async function getHistogram(hashName, itemNameId) {
@@ -262,16 +345,11 @@ async function getHistogram(hashName, itemNameId) {
     throw new Error('Steam returned an unexpected order-book response');
   }
 
-  const buyTablePrice = parseLocalisedPrice(data.buy_order_table?.[0]?.price);
-  const sellTablePrice = parseLocalisedPrice(data.sell_order_table?.[0]?.price);
-  const highestBuy = buyTablePrice ?? (Number(data.highest_buy_order || 0) / 100);
-  const lowestSell = sellTablePrice ?? (Number(data.lowest_sell_order || 0) / 100);
-
   return {
-    highestBuy,
-    lowestSell,
-    buyOrdersAtTop: Number(data.buy_order_table?.[0]?.count || 0),
-    sellOrdersAtTop: Number(data.sell_order_table?.[0]?.count || 0),
+    highestBuy: Number(data.highest_buy_order || 0) / 100,
+    lowestSell: Number(data.lowest_sell_order || 0) / 100,
+    buyDepthAtTop: bestGraphDepth(data.buy_order_graph, 'buy'),
+    sellDepthAtTop: bestGraphDepth(data.sell_order_graph, 'sell'),
     totalBuyOrders: parseVolume(String(data.buy_order_summary || '')),
     totalSellOrders: parseVolume(String(data.sell_order_summary || ''))
   };
@@ -288,6 +366,7 @@ async function getPriceOverview(hashName) {
     headers: { Referer: makeMarketUrl(hashName) }
   }, 1);
   const data = await response.json();
+  if (!data || data.success === false) throw new Error('Steam price overview was unavailable');
   return {
     volume: parseVolume(data.volume),
     medianPrice: parseLocalisedPrice(data.median_price),
@@ -295,51 +374,127 @@ async function getPriceOverview(hashName) {
   };
 }
 
+function getCachedSnapshot(hashName) {
+  const cached = snapshotCache[hashName];
+  if (!cached?.updatedAt) return null;
+  const age = Date.now() - Date.parse(cached.updatedAt);
+  return Number.isFinite(age) && age < SNAPSHOT_TTL_MS ? cached : null;
+}
+
+function saveSnapshot(hashName, snapshot) {
+  snapshotCache[hashName] = { ...snapshot, updatedAt: new Date().toISOString() };
+  const entries = Object.entries(snapshotCache)
+    .filter(([, value]) => Date.now() - Date.parse(value.updatedAt || 0) < 24 * 60 * 60 * 1000)
+    .slice(-500);
+  snapshotCache = Object.fromEntries(entries);
+  saveJsonAtomic(SNAPSHOT_CACHE_FILE, snapshotCache);
+}
+
+async function getMarketSnapshot(hashName, includeOverview = false) {
+  const cached = getCachedSnapshot(hashName);
+  if (cached && (!includeOverview || cached.overview)) return cached;
+
+  const itemNameId = await getItemNameId(hashName);
+  const histogram = cached?.histogram || await getHistogram(hashName, itemNameId);
+  const snapshot = { itemNameId, histogram, overview: cached?.overview || null };
+  if (includeOverview && !snapshot.overview) snapshot.overview = await getPriceOverview(hashName);
+  saveSnapshot(hashName, snapshot);
+  return snapshot;
+}
+
 function scoreCandidate(candidate) {
   const profitScore = clamp(candidate.profit * 350, 0, 30);
   const roiScore = clamp(candidate.roi * 30, 0, 30);
   const volumeScore = clamp(Math.log10(candidate.volume + 1) * 12, 0, 25);
-  const queuePenalty = clamp(Math.log10(candidate.buyOrdersAtTop + 1) * 4, 0, 10);
-  const sellQueuePenalty = clamp(Math.log10(candidate.sellOrdersAtTop + 1) * 2, 0, 5);
-  return Math.round(clamp(profitScore + roiScore + volumeScore - queuePenalty - sellQueuePenalty, 0, 100));
+  const buyDepthPenalty = clamp(Math.log10(candidate.buyDepthAtTop + 1) * 4, 0, 10);
+  const sellDepthPenalty = clamp(Math.log10(candidate.sellDepthAtTop + 1) * 2, 0, 5);
+  return Math.round(clamp(profitScore + roiScore + volumeScore - buyDepthPenalty - sellDepthPenalty, 0, 100));
+}
+
+function makeRejection(reason, item, metrics = {}) {
+  return {
+    reason,
+    name: item.name,
+    hashName: item.hashName,
+    marketUrl: makeMarketUrl(item.hashName),
+    ...metrics
+  };
 }
 
 async function analyseItem(result, settings) {
   const hashName = result.hash_name || result.asset_description?.market_hash_name;
   const name = result.name || result.asset_description?.name || hashName;
   const type = result.asset_description?.type || '';
+  const item = { hashName, name, type };
 
-  if (!settings.includeFoils && /foil/i.test(`${name} ${type}`)) return null;
-
-  const itemNameId = await getItemNameId(hashName);
-  const histogram = await getHistogram(hashName, itemNameId);
-  let overview = { volume: 0, medianPrice: null, lowestPrice: null };
-  try {
-    overview = await getPriceOverview(hashName);
-  } catch {
-    // Volume is useful but optional. Keep the order-book result.
+  if (!settings.includeFoils && /foil/i.test(`${name} ${type}`)) {
+    return { rejection: makeRejection('foil excluded', item) };
   }
 
+  const searchSellPrice = searchResultSellPrice(result);
+  if (searchSellPrice !== null && searchSellPrice < 0.04) {
+    return { rejection: makeRejection('selling price too low for fees', item, { currentLowestSell: searchSellPrice }) };
+  }
+
+  const firstSnapshot = await getMarketSnapshot(hashName, false);
+  const histogram = firstSnapshot.histogram;
   const highestBuy = histogram.highestBuy;
-  const lowestSell = histogram.lowestSell || overview.lowestPrice || 0;
-  if (!(highestBuy > 0) || !(lowestSell > 0)) return null;
+  const lowestSell = histogram.lowestSell || searchSellPrice || 0;
+  if (!(highestBuy > 0) || !(lowestSell > 0)) {
+    return { rejection: makeRejection('missing live buy or sell orders', item) };
+  }
 
   const buyPrice = Number((highestBuy + 0.01).toFixed(2));
   const sellPrice = Number(Math.max(0.03, lowestSell - settings.sellUndercut).toFixed(2));
-  if (buyPrice >= sellPrice) return null;
+  if (buyPrice >= sellPrice) {
+    return { rejection: makeRejection('no usable spread', item, { buyPrice, sellPrice }) };
+  }
 
-  const feeResult = sellerReceivesFromBuyerPrice(
-    sellPrice,
-    settings.steamFeeRate,
-    settings.publisherFeeRate
-  );
+  const feeResult = sellerReceivesFromBuyerPrice(sellPrice, settings.steamFeeRate, settings.publisherFeeRate);
   const profit = Number((feeResult.sellerReceives - buyPrice).toFixed(2));
   const roi = buyPrice > 0 ? profit / buyPrice : 0;
+  const metrics = {
+    buyPrice,
+    sellPrice,
+    sellerReceives: feeResult.sellerReceives,
+    profit,
+    roi,
+    currentHighestBuy: highestBuy,
+    currentLowestSell: lowestSell
+  };
 
+  if (buyPrice > settings.maxBuyPrice) {
+    return { rejection: makeRejection('above maximum buy price', item, metrics) };
+  }
+  if (settings.walletBalance > 0 && buyPrice > settings.walletBalance) {
+    return { rejection: makeRejection('above wallet balance', item, metrics) };
+  }
+  if (profit < settings.minProfit) {
+    return { rejection: makeRejection('profit below minimum', item, metrics) };
+  }
+  if (roi < settings.minRoi) {
+    return { rejection: makeRejection('ROI below minimum', item, metrics) };
+  }
+
+  let overview = firstSnapshot.overview;
+  if (!overview) {
+    try {
+      overview = (await getMarketSnapshot(hashName, true)).overview;
+    } catch {
+      overview = { volume: 0, medianPrice: null, lowestPrice: null };
+    }
+  }
+  const volume = overview?.volume || 0;
+  if (volume < settings.minVolume) {
+    return { rejection: makeRejection('volume below minimum', item, { ...metrics, volume }) };
+  }
+
+  const affordableQty = settings.walletBalance > 0 ? Math.floor(settings.walletBalance / buyPrice) : null;
   const candidate = {
     name,
     hashName,
     type,
+    discoveryPool: result.discoveryPool || 'unknown',
     image: result.asset_description?.icon_url
       ? `https://community.fastly.steamstatic.com/economy/image/${result.asset_description.icon_url}/96fx96f`
       : '',
@@ -352,26 +507,38 @@ async function analyseItem(result, settings) {
     fees: feeResult.fees,
     profit,
     roi,
-    volume: overview.volume,
-    medianPrice: overview.medianPrice,
+    volume,
+    medianPrice: overview?.medianPrice ?? null,
     sellListings: Number(result.sell_listings || 0),
-    buyOrdersAtTop: histogram.buyOrdersAtTop,
-    sellOrdersAtTop: histogram.sellOrdersAtTop,
+    buyDepthAtTop: histogram.buyDepthAtTop,
+    sellDepthAtTop: histogram.sellDepthAtTop,
     totalBuyOrders: histogram.totalBuyOrders,
-    totalSellOrders: histogram.totalSellOrders
+    totalSellOrders: histogram.totalSellOrders,
+    affordableQty
   };
   candidate.score = scoreCandidate(candidate);
-  return candidate;
+  return { candidate };
+}
+
+function rejectionDistance(entry, settings) {
+  switch (entry.reason) {
+    case 'profit below minimum': return Math.max(0, settings.minProfit - (entry.profit || 0));
+    case 'ROI below minimum': return Math.max(0, settings.minRoi - (entry.roi || 0));
+    case 'volume below minimum': return Math.max(0, settings.minVolume - (entry.volume || 0)) / 100;
+    case 'above maximum buy price': return Math.max(0, (entry.buyPrice || 0) - settings.maxBuyPrice);
+    default: return 999;
+  }
 }
 
 async function runScan(searchParams) {
   const pages = clamp(Number(searchParams.get('pages') || 3), 1, 10);
-  const limit = clamp(Number(searchParams.get('limit') || 25), 1, 100);
-  const delayMs = clamp(Number(searchParams.get('delayMs') || 2400), 1200, 10_000);
-  const minProfit = clamp(Number(searchParams.get('minProfit') || 0.02), 0, 10);
-  const minRoi = clamp(Number(searchParams.get('minRoi') || 20) / 100, 0, 10);
-  const minVolume = clamp(Number(searchParams.get('minVolume') || 5), 0, 1_000_000);
+  const limit = clamp(Number(searchParams.get('limit') || 60), 1, 200);
+  const delayMs = clamp(Number(searchParams.get('delayMs') || 1800), 900, 10_000);
+  const minProfit = clamp(Number(searchParams.get('minProfit') || 0.01), 0, 10);
+  const minRoi = clamp(Number(searchParams.get('minRoi') || 10) / 100, 0, 10);
+  const minVolume = clamp(Number(searchParams.get('minVolume') || 0), 0, 1_000_000);
   const maxBuyPrice = clamp(Number(searchParams.get('maxBuyPrice') || 0.25), 0.01, 1_000);
+  const walletBalance = clamp(Number(searchParams.get('walletBalance') || walletState.balance || 0), 0, 1_000_000);
   const includeFoils = searchParams.get('includeFoils') === 'true';
   const publisherFeeRate = clamp(Number(searchParams.get('publisherFee') || 10) / 100, 0, 1);
   const steamFeeRate = clamp(Number(searchParams.get('steamFee') || 5) / 100, 0, 1);
@@ -381,28 +548,27 @@ async function runScan(searchParams) {
     includeFoils,
     publisherFeeRate,
     steamFeeRate,
-    sellUndercut
+    sellUndercut,
+    minProfit,
+    minRoi,
+    minVolume,
+    maxBuyPrice,
+    walletBalance
   };
 
-  const rawResults = await getSearchResults({ pages, sortColumn: 'popular', sortDir: 'desc' });
+  const rawResults = await getSearchResults({ pages });
   const candidates = [];
+  const rejections = [];
   const errors = [];
-  const sourceItems = rawResults.slice(0, Math.max(limit * 2, limit));
+  const sourceItems = rawResults.slice(0, limit);
 
-  for (let index = 0; index < sourceItems.length && candidates.length < limit; index += 1) {
+  for (let index = 0; index < sourceItems.length; index += 1) {
     const item = sourceItems[index];
     const hashName = item.hash_name || item.asset_description?.market_hash_name || `item-${index}`;
     try {
-      const candidate = await analyseItem(item, settings);
-      if (
-        candidate
-        && candidate.buyPrice <= maxBuyPrice
-        && candidate.profit >= minProfit
-        && candidate.roi >= minRoi
-        && candidate.volume >= minVolume
-      ) {
-        candidates.push(candidate);
-      }
+      const result = await analyseItem(item, settings);
+      if (result.candidate) candidates.push(result.candidate);
+      if (result.rejection) rejections.push(result.rejection);
     } catch (error) {
       errors.push({ item: hashName, message: error.message });
     }
@@ -410,12 +576,24 @@ async function runScan(searchParams) {
   }
 
   candidates.sort((a, b) => b.score - a.score || b.profit - a.profit || b.volume - a.volume);
+  const rejectionCounts = rejections.reduce((counts, rejection) => {
+    counts[rejection.reason] = (counts[rejection.reason] || 0) + 1;
+    return counts;
+  }, {});
+  const nearMisses = rejections
+    .filter(entry => ['profit below minimum', 'ROI below minimum', 'volume below minimum', 'above maximum buy price'].includes(entry.reason))
+    .sort((a, b) => rejectionDistance(a, settings) - rejectionDistance(b, settings))
+    .slice(0, 12);
+
   return {
     generatedAt: new Date().toISOString(),
+    discovered: rawResults.length,
     scanned: sourceItems.length,
     matched: candidates.length,
     candidates,
-    warnings: errors.slice(0, 10),
+    nearMisses,
+    rejectionCounts,
+    warnings: errors.slice(0, 20),
     settings: {
       pages,
       limit,
@@ -424,6 +602,7 @@ async function runScan(searchParams) {
       minRoi: minRoi * 100,
       minVolume,
       maxBuyPrice,
+      walletBalance,
       includeFoils,
       publisherFee: publisherFeeRate * 100,
       steamFee: steamFeeRate * 100,
@@ -432,11 +611,55 @@ async function runScan(searchParams) {
   };
 }
 
+function updateWallet(payload, sourceFallback = 'manual') {
+  const balance = Number(payload.balance);
+  if (!Number.isFinite(balance) || balance < 0 || balance > 1_000_000) {
+    throw new Error('Balance must be a valid non-negative number');
+  }
+  walletState = {
+    balance: Number(balance.toFixed(2)),
+    currency: typeof payload.currency === 'string' ? payload.currency.slice(0, 8) : 'EUR',
+    source: typeof payload.source === 'string' ? payload.source.slice(0, 64) : sourceFallback,
+    updatedAt: new Date().toISOString()
+  };
+  saveJsonAtomic(WALLET_FILE, walletState);
+  return walletState;
+}
+
 const server = http.createServer(async (req, res) => {
   const requestUrl = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
 
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Max-Age': '86400'
+    });
+    res.end();
+    return;
+  }
+
   if (requestUrl.pathname === '/api/health') {
-    sendJson(res, 200, { ok: true, version: '1.0.0' });
+    sendJson(res, 200, { ok: true, version: '1.1.0' });
+    return;
+  }
+
+  if (requestUrl.pathname === '/api/wallet') {
+    if (req.method === 'GET') {
+      sendJson(res, 200, walletState);
+      return;
+    }
+    if (req.method === 'POST') {
+      try {
+        const payload = await readJsonBody(req);
+        sendJson(res, 200, updateWallet(payload, 'local-app'));
+      } catch (error) {
+        sendJson(res, 400, { error: error.message });
+      }
+      return;
+    }
+    sendJson(res, 405, { error: 'Method not allowed' }, { Allow: 'GET, POST, OPTIONS' });
     return;
   }
 
@@ -455,7 +678,7 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       sendJson(res, 502, {
         error: error.message || 'Scan failed',
-        hint: 'Steam may be rate-limiting public market requests. Wait before scanning again or use the manual calculator.'
+        hint: 'Steam may be rate-limiting public market requests. Wait before scanning again, raise the delay, or use the manual calculator.'
       });
     }
     return;
