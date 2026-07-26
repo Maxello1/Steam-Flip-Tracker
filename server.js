@@ -13,7 +13,7 @@ const ITEM_NAME_CACHE_FILE = path.join(DATA_DIR, 'item-name-cache.json');
 const SNAPSHOT_CACHE_FILE = path.join(DATA_DIR, 'market-snapshot-cache.json');
 const WALLET_FILE = path.join(DATA_DIR, 'wallet-balance.json');
 
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36 SteamFlipTracker/1.1';
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36 SteamFlipTracker/1.1.1';
 const STEAM_BASE = 'https://steamcommunity.com';
 const SNAPSHOT_TTL_MS = 10 * 60 * 1000;
 
@@ -42,13 +42,8 @@ let walletState = loadJson(WALLET_FILE, {
   updatedAt: null
 });
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function clamp(value, min, max) {
-  return Math.min(max, Math.max(min, value));
-}
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
 function sendJson(res, status, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload);
@@ -234,6 +229,9 @@ async function getSearchPool({ pages, sortColumn, sortDir, poolName }) {
     url.searchParams.set('sort_column', sortColumn);
     url.searchParams.set('sort_dir', sortDir);
     url.searchParams.set('appid', '753');
+    url.searchParams.set('country', 'DE');
+    url.searchParams.set('currency', '3');
+    url.searchParams.set('l', 'english');
     url.searchParams.append('category_753_item_class[]', 'tag_item_class_2');
 
     const response = await steamFetch(url);
@@ -288,29 +286,118 @@ async function getSearchResults({ pages }) {
   return interleavePools([popular, cheap]);
 }
 
-async function getItemNameId(hashName) {
-  const cached = itemNameCache[hashName];
-  if (cached?.itemNameId) return cached.itemNameId;
+function decodeHtmlEntities(value) {
+  return String(value || '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#([0-9]+);/g, (_, decimal) => String.fromCodePoint(Number(decimal)))
+    .replace(/&nbsp;|&ensp;|&emsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+}
 
-  const marketUrl = makeMarketUrl(hashName);
-  const response = await steamFetch(marketUrl, {
-    headers: { Referer: `${STEAM_BASE}/market/` }
-  });
-  const html = await response.text();
+function htmlToMarketText(html, removeScripts = true) {
+  let value = String(html || '');
+  if (removeScripts) {
+    value = value
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ');
+  }
+  value = value
+    .replace(/<(?:br|hr)\b[^>]*>/gi, '\n')
+    .replace(/<\/(?:p|div|li|tr|td|th|h[1-6]|section|article|table|thead|tbody)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ');
+  return decodeHtmlEntities(value)
+    .replace(/\r/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n\s*/g, '\n')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+}
+
+const CURRENCY_PREFIX = '(?:[A-Z]{3}\\s*)?(?:R\\$\\s*)?[€£$¥₹₽₩₺₴₫₱]?\\s*';
+const PRICE_NUMBER = '[0-9]+(?:[.,][0-9]{1,2})?';
+
+function firstPriceQuantity(section, expectedPrice) {
+  if (!section || !(expectedPrice > 0)) return 0;
+  const regex = new RegExp(`${CURRENCY_PREFIX}(${PRICE_NUMBER})\\s+([0-9][0-9.,]*)`, 'gi');
+  for (const match of section.matchAll(regex)) {
+    const price = parseLocalisedPrice(match[1]);
+    if (price !== null && Math.abs(price - expectedPrice) < 0.001) {
+      return parseVolume(match[2]);
+    }
+  }
+  return 0;
+}
+
+function parseListingOrderBookFromText(text) {
+  const sellRegex = new RegExp(`([0-9][0-9.,]*)\\s+for sale starting at\\s+(${CURRENCY_PREFIX}${PRICE_NUMBER})`, 'i');
+  const buyRegex = new RegExp(`([0-9][0-9.,]*)\\s+requests? to buy at\\s+(${CURRENCY_PREFIX}${PRICE_NUMBER})\\s+or lower`, 'i');
+  const sellMatch = sellRegex.exec(text);
+  const buyMatch = buyRegex.exec(text);
+  if (!sellMatch || !buyMatch) return null;
+
+  const lowestSell = parseLocalisedPrice(sellMatch[2]);
+  const highestBuy = parseLocalisedPrice(buyMatch[2]);
+  if (!(lowestSell > 0) || !(highestBuy > 0)) return null;
+
+  const sellSection = text.slice(sellMatch.index + sellMatch[0].length, buyMatch.index);
+  const buySection = text.slice(buyMatch.index + buyMatch[0].length);
+  return {
+    highestBuy,
+    lowestSell,
+    buyDepthAtTop: firstPriceQuantity(buySection, highestBuy),
+    sellDepthAtTop: firstPriceQuantity(sellSection, lowestSell),
+    totalBuyOrders: parseVolume(buyMatch[1]),
+    totalSellOrders: parseVolume(sellMatch[1]),
+    source: 'listing-html'
+  };
+}
+
+function parseListingOrderBook(html) {
+  const visibleText = htmlToMarketText(html, true);
+  const visibleResult = parseListingOrderBookFromText(visibleText);
+  if (visibleResult) return visibleResult;
+
+  // Some Steam variants place the same rendered strings in hydration data.
+  const allText = htmlToMarketText(html, false);
+  return parseListingOrderBookFromText(allText);
+}
+
+function extractItemNameId(html) {
   const patterns = [
     /Market_LoadOrderSpread\(\s*(\d+)\s*\)/i,
     /item_nameid["']?\s*[:=]\s*["']?(\d+)/i,
-    /ItemActivityTicker\.Start\(\s*(\d+)\s*\)/i
+    /ItemActivityTicker\.Start\(\s*(\d+)\s*\)/i,
+    /itemNameId["']?\s*[:=]\s*["']?(\d+)/i
   ];
-  const match = patterns.map(pattern => html.match(pattern)).find(Boolean);
-  if (!match) throw new Error('Could not read the Steam item name ID');
+  const match = patterns.map(pattern => String(html || '').match(pattern)).find(Boolean);
+  return match?.[1] || null;
+}
 
-  itemNameCache[hashName] = {
-    itemNameId: match[1],
-    updatedAt: new Date().toISOString()
-  };
-  saveJsonAtomic(ITEM_NAME_CACHE_FILE, itemNameCache);
-  return match[1];
+async function fetchListingPage(hashName) {
+  const url = new URL(makeMarketUrl(hashName));
+  url.searchParams.set('l', 'english');
+  url.searchParams.set('country', 'DE');
+  url.searchParams.set('currency', '3');
+  const response = await steamFetch(url, {
+    headers: { Referer: `${STEAM_BASE}/market/` }
+  });
+  const html = await response.text();
+  const itemNameId = extractItemNameId(html);
+  const histogram = parseListingOrderBook(html);
+
+  if (itemNameId) {
+    itemNameCache[hashName] = {
+      itemNameId,
+      updatedAt: new Date().toISOString()
+    };
+    saveJsonAtomic(ITEM_NAME_CACHE_FILE, itemNameCache);
+  }
+
+  return { itemNameId, histogram };
 }
 
 function bestGraphDepth(graph, mode) {
@@ -351,7 +438,8 @@ async function getHistogram(hashName, itemNameId) {
     buyDepthAtTop: bestGraphDepth(data.buy_order_graph, 'buy'),
     sellDepthAtTop: bestGraphDepth(data.sell_order_graph, 'sell'),
     totalBuyOrders: parseVolume(String(data.buy_order_summary || '')),
-    totalSellOrders: parseVolume(String(data.sell_order_summary || ''))
+    totalSellOrders: parseVolume(String(data.sell_order_summary || '')),
+    source: 'itemordershistogram'
   };
 }
 
@@ -394,9 +482,46 @@ async function getMarketSnapshot(hashName, includeOverview = false) {
   const cached = getCachedSnapshot(hashName);
   if (cached && (!includeOverview || cached.overview)) return cached;
 
-  const itemNameId = await getItemNameId(hashName);
-  const histogram = cached?.histogram || await getHistogram(hashName, itemNameId);
-  const snapshot = { itemNameId, histogram, overview: cached?.overview || null };
+  let itemNameId = cached?.itemNameId || itemNameCache[hashName]?.itemNameId || null;
+  let histogram = cached?.histogram || null;
+  let listingPage = null;
+  let histogramError = null;
+
+  if (!histogram && itemNameId) {
+    try {
+      histogram = await getHistogram(hashName, itemNameId);
+    } catch (error) {
+      histogramError = error;
+    }
+  }
+
+  if (!histogram) {
+    listingPage = await fetchListingPage(hashName);
+    itemNameId = listingPage.itemNameId || itemNameId;
+
+    if (itemNameId && !histogramError) {
+      try {
+        histogram = await getHistogram(hashName, itemNameId);
+      } catch (error) {
+        histogramError = error;
+      }
+    }
+
+    // Market Beta no longer exposes item_nameid on every listing, but it does
+    // render the live best buy/sell rows directly into the listing page.
+    histogram = histogram || listingPage.histogram;
+  }
+
+  if (!histogram) {
+    const details = histogramError ? ` (${histogramError.message})` : '';
+    throw new Error(`Could not read Steam order-book data from the histogram or listing page${details}`);
+  }
+
+  const snapshot = {
+    itemNameId,
+    histogram,
+    overview: cached?.overview || null
+  };
   if (includeOverview && !snapshot.overview) snapshot.overview = await getPriceOverview(hashName);
   saveSnapshot(hashName, snapshot);
   return snapshot;
@@ -514,6 +639,7 @@ async function analyseItem(result, settings) {
     sellDepthAtTop: histogram.sellDepthAtTop,
     totalBuyOrders: histogram.totalBuyOrders,
     totalSellOrders: histogram.totalSellOrders,
+    orderBookSource: histogram.source || 'unknown',
     affordableQty
   };
   candidate.score = scoreCandidate(candidate);
@@ -641,7 +767,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (requestUrl.pathname === '/api/health') {
-    sendJson(res, 200, { ok: true, version: '1.1.0' });
+    sendJson(res, 200, { ok: true, version: '1.1.1' });
     return;
   }
 
@@ -687,7 +813,15 @@ const server = http.createServer(async (req, res) => {
   serveStatic(req, res, requestUrl.pathname);
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Steam Flip Tracker is running at http://${HOST}:${PORT}`);
-  console.log('Press Ctrl+C to stop it.');
-});
+if (require.main === module) {
+  server.listen(PORT, HOST, () => {
+    console.log(`Steam Flip Tracker is running at http://${HOST}:${PORT}`);
+    console.log('Press Ctrl+C to stop it.');
+  });
+}
+
+module.exports = {
+  parseListingOrderBook,
+  parseLocalisedPrice,
+  sellerReceivesFromBuyerPrice
+};
