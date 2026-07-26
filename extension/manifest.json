@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Steam Flip Tracker Balance Sync",
+  "version": "1.0.0",
+  "description": "Reads the wallet balance shown on an open Steam Market page and sends only that number to the local Steam Flip Tracker.",
+  "permissions": [],
+  "host_permissions": ["http://127.0.0.1:3210/*"],
+  "background": { "service_worker": "service-worker.js" },
+  "content_scripts": [{
+    "matches": ["https://steamcommunity.com/market/*"],
+    "js": ["content.js"],
+    "run_at": "document_idle"
+  }]
+}
