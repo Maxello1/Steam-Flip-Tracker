@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Steam Flip Tracker</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">READ-ONLY MARKET HELPER</p>
+      <h1>Steam Flip Tracker</h1>
+      <p class="subtitle">Find possible card spreads, calculate fees and track every manual trade.</p>
+    </div>
+    <div class="balance-box">
+      <label for="walletBalance">Wallet balance</label>
+      <div class="money-input"><span>€</span><input id="walletBalance" type="number" min="0" step="0.01" value="2.21"></div>
+    </div>
+  </header>
+
+  <main>
+    <section class="notice">
+      <strong>No Steam login is used.</strong> This app never places, cancels or confirms orders. The scanner only reads public market pages; all trades remain manual.
+    </section>
+
+    <nav class="tabs" aria-label="Sections">
+      <button class="tab active" data-tab="scanner">Scanner</button>
+      <button class="tab" data-tab="calculator">Calculator</button>
+      <button class="tab" data-tab="tracker">Trade tracker <span id="tradeCount" class="badge">0</span></button>
+    </nav>
+
+    <section id="scanner" class="panel tab-panel active">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">PUBLIC DATA SCAN</p>
+          <h2>Card recommendations</h2>
+          <p>Recommendations are estimates, not guarantees. Always verify the live order book before buying.</p>
+        </div>
+        <button id="scanButton" class="primary">Scan popular cards</button>
+      </div>
+
+      <details class="settings">
+        <summary>Scanner settings</summary>
+        <div class="settings-grid">
+          <label>Search pages<input id="pages" type="number" min="1" max="10" value="3"></label>
+          <label>Maximum results<input id="limit" type="number" min="1" max="100" value="20"></label>
+          <label>Maximum buy price (€)<input id="maxBuyPrice" type="number" min="0.01" step="0.01" value="0.25"></label>
+          <label>Minimum profit (€)<input id="minProfit" type="number" min="0" step="0.01" value="0.02"></label>
+          <label>Minimum ROI (%)<input id="minRoi" type="number" min="0" step="1" value="20"></label>
+          <label>Minimum recent volume<input id="minVolume" type="number" min="0" step="1" value="5"></label>
+          <label>Delay per item (ms)<input id="delayMs" type="number" min="1200" step="100" value="2400"></label>
+          <label>Sell undercut (€)<input id="sellUndercut" type="number" min="0" step="0.01" value="0.01"></label>
+          <label>Steam fee (%)<input id="steamFee" type="number" min="0" step="0.1" value="5"></label>
+          <label>Game fee (%)<input id="publisherFee" type="number" min="0" step="0.1" value="10"></label>
+          <label class="checkbox"><input id="includeFoils" type="checkbox"> Include foil cards</label>
+        </div>
+      </details>
+
+      <div id="scanStatus" class="status hidden"></div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Score</th>
+              <th>Card</th>
+              <th>Buy order</th>
+              <th>Sell listing</th>
+              <th>You receive</th>
+              <th>Profit</th>
+              <th>ROI</th>
+              <th>Recent volume</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="recommendationsBody">
+            <tr class="empty-row"><td colspan="9">Run a scan to look for possible flips.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="calculator" class="panel tab-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">MANUAL CHECK</p>
+          <h2>Flip calculator</h2>
+          <p>Paste live prices from a Steam listing to check the actual fee-adjusted result.</p>
+        </div>
+      </div>
+
+      <div class="calculator-grid">
+        <label>Card name<input id="calcName" type="text" placeholder="Example: Card name"></label>
+        <label>Buy-order price (€)<input id="calcBuy" type="number" min="0" step="0.01" value="0.05"></label>
+        <label>Buyer pays when sold (€)<input id="calcSell" type="number" min="0" step="0.01" value="0.09"></label>
+        <label>Estimated volume<input id="calcVolume" type="number" min="0" step="1" value="10"></label>
+        <label>Steam fee (%)<input id="calcSteamFee" type="number" min="0" step="0.1" value="5"></label>
+        <label>Game fee (%)<input id="calcPublisherFee" type="number" min="0" step="0.1" value="10"></label>
+      </div>
+
+      <div class="result-cards">
+        <article><span>You receive</span><strong id="calcReceive">€0.00</strong></article>
+        <article><span>Fees</span><strong id="calcFees">€0.00</strong></article>
+        <article><span>Net profit</span><strong id="calcProfit">€0.00</strong></article>
+        <article><span>ROI</span><strong id="calcRoi">0%</strong></article>
+      </div>
+      <div class="actions-row">
+        <button id="addManualTrade" class="primary">Add purchase to tracker</button>
+      </div>
+    </section>
+
+    <section id="tracker" class="panel tab-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">LOCAL STORAGE</p>
+          <h2>Trade tracker</h2>
+          <p>Your tracker data stays in this browser unless you export it.</p>
+        </div>
+        <div class="actions-row">
+          <button id="exportButton" class="secondary">Export CSV</button>
+          <button id="clearButton" class="danger">Clear tracker</button>
+        </div>
+      </div>
+
+      <div class="summary-grid">
+        <article><span>Capital committed</span><strong id="summaryCommitted">€0.00</strong></article>
+        <article><span>Expected profit</span><strong id="summaryExpected">€0.00</strong></article>
+        <article><span>Realised profit</span><strong id="summaryRealised">€0.00</strong></article>
+        <article><span>Active trades</span><strong id="summaryActive">0</strong></article>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Card</th>
+              <th>Status</th>
+              <th>Qty</th>
+              <th>Paid each</th>
+              <th>Target sell</th>
+              <th>Expected profit</th>
+              <th>Actual sell</th>
+              <th>Realised profit</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="trackerBody">
+            <tr class="empty-row"><td colspan="9">No trades tracked yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <template id="recommendationTemplate">
+    <tr>
+      <td><span class="score"></span></td>
+      <td class="item-cell"><img class="item-image" alt=""><div><a class="item-link" target="_blank" rel="noopener"></a><small class="item-meta"></small></div></td>
+      <td class="buy-price"></td>
+      <td class="sell-price"></td>
+      <td class="receive-price"></td>
+      <td class="profit"></td>
+      <td class="roi"></td>
+      <td class="volume"></td>
+      <td><button class="small add-button">Track</button></td>
+    </tr>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>

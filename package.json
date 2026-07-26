@@ -1,0 +1,13 @@
+{
+  "name": "steam-flip-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Read-only Steam Community Market card scanner, fee calculator and manual trade tracker.",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check public/app.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
